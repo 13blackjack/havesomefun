@@ -212,7 +212,7 @@ def signal(window):#'M5', 'M10';'RNN','KNN'
     else:
         return 'red'
 
-    
+#onetimebuyorsell    
 def trade(window,way,n=3, units=10):#'M5', 'M10', ;'RNN','KNN'; 100
     accountID = '101-001-11847054-001'
     access_token="3c247797cbba6a94f8b19499c50dbee2-7dcfd0a4cde2a91e1eb79eceece13fcd"
@@ -235,6 +235,7 @@ def trade(window,way,n=3, units=10):#'M5', 'M10', ;'RNN','KNN'; 100
     print(r)
     print(json.dumps(rv, indent = 4))
 
+#automatic trade in a period
 def periodtrade(window, looptime, way, units=10, n=3):#'M5'(3,4,5,10,15), second, 'RNN'/'KNN', 
     accountID = '101-001-11847054-001'
     access_token="3c247797cbba6a94f8b19499c50dbee2-7dcfd0a4cde2a91e1eb79eceece13fcd"
