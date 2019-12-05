@@ -1,0 +1,371 @@
+from __future__ import absolute_import, division, print_function, unicode_literals
+import tensorflow as tf
+from sklearn.neighbors import KNeighborsClassifier
+
+import json
+from oandapyV20 import API
+import oandapyV20.endpoints.instruments as instruments
+from oandapyV20.contrib.requests import MarketOrderRequest
+from oandapyV20.contrib.requests import TakeProfitDetails, StopLossDetails
+import oandapyV20.endpoints.orders as orders
+import oandapyV20.endpoints.accounts as accounts
+import oandapyV20.endpoints.trades as trades
+ 
+import datetime
+import time
+import pandas as pd
+import numpy as np
+from matplotlib import pyplot as plt
+
+
+
+
+##DATA
+def data_lstm(window):#'M5', 'M10'
+    access_token="3c247797cbba6a94f8b19499c50dbee2-7dcfd0a4cde2a91e1eb79eceece13fcd"
+    client=API(access_token=access_token)
+    params={ 'count':5000,"granularity":window,'price':'AB'}
+    r = instruments.InstrumentsCandles(instrument='EUR_USD', params = params)
+    data = client.request(r)
+    time = []
+    ao = []
+    ac = []
+    ah = []
+    al = []
+    bo = []
+    bc = []
+    bh = []
+    bl = []
+    v = []
+    for i in range(len(data['candles'])):
+        time.append(str(datetime.datetime.strptime(data['candles'][i]['time'][:-4],'%Y-%m-%dT%H:%M:%S.%f')))
+        ao.append(data['candles'][i]['ask']['o'])
+        ac.append(data['candles'][i]['ask']['c'])
+        ah.append(data['candles'][i]['ask']['h'])
+        al.append(data['candles'][i]['ask']['l'])
+        bo.append(data['candles'][i]['bid']['o'])
+        bc.append(data['candles'][i]['bid']['c'])
+        bh.append(data['candles'][i]['bid']['h'])
+        bl.append(data['candles'][i]['bid']['l'])
+        v.append(data['candles'][i]['volume'])
+    title={'Time':time,'Ask Price Open':ao,'Ask Price Closed':ac,'Ask Price High':ah,'Ask Price Low':al,'Bid Price Open':bo,'Bid Price Closed':bc,'Bid Price High':bh,'Bid Price Low':bl,'Volume':v}
+    dataset=pd.DataFrame(title)
+    dataset['Spread'] = dataset['Ask Price Closed'].astype(float) - dataset['Bid Price Closed'].astype(float)
+    dataset['Volume'] = dataset['Volume'].astype(float)
+    dataset['Bid Price Closed'] = (dataset['Bid Price Closed'].astype(float) + dataset['Ask Price Closed'].astype(float))/2
+    return dataset
+
+def data_knn(window):#'M5', 'M10'
+    access_token="3c247797cbba6a94f8b19499c50dbee2-7dcfd0a4cde2a91e1eb79eceece13fcd"
+    client=API(access_token=access_token)
+    params={ 'count':5000,"granularity":window,'price':'AB'}
+    r = instruments.InstrumentsCandles(instrument='EUR_USD', params = params)
+    data = client.request(r)
+    time = []
+    ao = []
+    ac = []
+    ah = []
+    al = []
+    bo = []
+    bc = []
+    bh = []
+    bl = []
+    v = []
+    for i in range(len(data['candles'])):
+        time.append(str(datetime.datetime.strptime(data['candles'][i]['time'][:-4],'%Y-%m-%dT%H:%M:%S.%f')))
+        ao.append(data['candles'][i]['ask']['o'])
+        ac.append(data['candles'][i]['ask']['c'])
+        ah.append(data['candles'][i]['ask']['h'])
+        al.append(data['candles'][i]['ask']['l'])
+        bo.append(data['candles'][i]['bid']['o'])
+        bc.append(data['candles'][i]['bid']['c'])
+        bh.append(data['candles'][i]['bid']['h'])
+        bl.append(data['candles'][i]['bid']['l'])
+        v.append(data['candles'][i]['volume'])    
+    title={'Time':time,'Ask Price Open':ao,'Ask Price Closed':ac,'Ask Price High':ah,'Ask Price Low':al,'Bid Price Open':bo,'Bid Price Closed':bc,'Bid Price High':bh,'Bid Price Low':bl,'Volume':v}
+    dataset=pd.DataFrame(title)    
+    #Label
+    dataset['Range'] = dataset['Bid Price High'].astype(float) - dataset['Bid Price Low'].astype(float)
+    dataset['Spread'] = dataset['Ask Price Closed'].astype(float) - dataset['Bid Price Closed'].astype(float)
+    dataset['Difference'] = dataset.shift(-1)['Bid Price Closed'].astype(float) - dataset.shift(-1)['Bid Price Open'].astype(float)
+    dataset['Change'] = dataset.shift(-1)['Bid Price Closed'].astype(float) - dataset['Bid Price Closed'].astype(float)
+    dataset = dataset.dropna()
+    dataset['Label'] = np.where((dataset['Change']>0)&(dataset['Difference']>0), 'green','red')
+    dataset['Bid Price Closed'] = (dataset['Bid Price Closed'].astype(float) + dataset['Ask Price Closed'].astype(float))/2
+    return dataset
+
+##LSTM
+#function
+def univariate_data(dataset, start_index, end_index, history_size, target_size):
+  data = []
+  labels = []
+
+  start_index = start_index + history_size
+  if end_index is None:
+    end_index = len(dataset) - target_size
+
+  for i in range(start_index, end_index):
+    indices = range(i-history_size, i)
+    # Reshape data from (history_size,) to (history_size, 1)
+    data.append(np.reshape(dataset[indices], (history_size, 1)))
+    labels.append(dataset[i+target_size])
+  return np.array(data), np.array(labels)
+
+def LSTM(window):
+    TRAIN_SPLIT = 4000
+    tf.random.set_seed(4)
+    
+    uni_data = data_lstm(window)['Bid Price Closed']
+    uni_data.index = data_lstm(window)['Time']
+    uni_data = uni_data.values
+    
+    uni_train_mean = uni_data[:TRAIN_SPLIT].mean()
+    uni_train_std = uni_data[:TRAIN_SPLIT].std()
+    uni_data = (uni_data-uni_train_mean)/uni_train_std
+    
+    univariate_past_history = 30
+    univariate_future_target = 0
+    
+    x_train_uni, y_train_uni = univariate_data(uni_data, 0, TRAIN_SPLIT,
+                                               univariate_past_history,
+                                               univariate_future_target)
+    x_val_uni, y_val_uni = univariate_data(uni_data, TRAIN_SPLIT, None,
+                                           univariate_past_history,
+                                           univariate_future_target)        
+    BATCH_SIZE = 256
+    BUFFER_SIZE = 1000
+    
+    train_univariate = tf.data.Dataset.from_tensor_slices((x_train_uni, y_train_uni))
+    train_univariate = train_univariate.cache().shuffle(BUFFER_SIZE).batch(BATCH_SIZE).repeat()
+    
+    val_univariate = tf.data.Dataset.from_tensor_slices((x_val_uni, y_val_uni))
+    val_univariate = val_univariate.batch(BATCH_SIZE).repeat()
+    
+    simple_lstm_model = tf.keras.models.Sequential([
+        tf.keras.layers.LSTM(8, input_shape=x_train_uni.shape[-2:]),
+        tf.keras.layers.Dense(1)])
+    
+    simple_lstm_model.compile(optimizer='adam', loss='mae')
+       
+    EVALUATION_INTERVAL = 200
+    EPOCHS = 10
+    
+    simple_lstm_model.fit(train_univariate, epochs=EPOCHS,
+                          steps_per_epoch=EVALUATION_INTERVAL,
+                          validation_data=val_univariate, validation_steps=50)
+    
+    pre_input = np.array(data_lstm(window)['Bid Price Closed'].tail(univariate_past_history))
+    pre_input = pre_input.reshape((1,univariate_past_history,1))
+    
+    prediction = simple_lstm_model.predict(pre_input)
+    return prediction
+
+def knn_test(window):
+    n1 = 2
+    n2 = 3
+    n3 = 4
+    n4 = 5
+    n5 = 6
+    n6 = 7
+    n7 = 8
+    n8 = 9
+    n9 = 10
+    neigh_2 = KNeighborsClassifier(n_neighbors=n1)
+    neigh_3 = KNeighborsClassifier(n_neighbors=n2)
+    neigh_4 = KNeighborsClassifier(n_neighbors=n3)
+    neigh_5 = KNeighborsClassifier(n_neighbors=n4)
+    neigh_6 = KNeighborsClassifier(n_neighbors=n5)
+    neigh_7 = KNeighborsClassifier(n_neighbors=n6)
+    neigh_8 = KNeighborsClassifier(n_neighbors=n7)
+    neigh_9 = KNeighborsClassifier(n_neighbors=n8)
+    neigh_10 = KNeighborsClassifier(n_neighbors=n9)
+    neigh_2.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN at {} n:'.format(n1), round(neigh_2.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    neigh_3.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN:at {} n:'.format(n2), round(neigh_3.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    neigh_4.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN:at {} n:'.format(n3), round(neigh_4.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    neigh_5.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN:at {} n:'.format(n4), round(neigh_5.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    neigh_6.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN at {} n:'.format(n5), round(neigh_6.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    neigh_7.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN:at {} n:'.format(n6), round(neigh_7.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    neigh_8.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN:at {} n:'.format(n7), round(neigh_8.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    neigh_9.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN:at {} n:'.format(n8), round(neigh_9.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    neigh_10.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    print('The accuracy of KNN:at {} n:'.format(n9), round(neigh_10.score(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']],data_knn(window)['Label']),2))
+    
+def knn(n, window):
+    neigh_2 = KNeighborsClassifier(n_neighbors=n)
+    neigh_2.fit(data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']], data_knn(window)['Label'])
+    pre_input = data_knn(window)[['Bid Price Closed','Range','Spread', 'Volume']].tail(1)
+    prediction = neigh_2.predict(pre_input)
+    return prediction
+
+def signal(window):#'M5', 'M10';'RNN','KNN'
+
+    if LSTM(window) > data_lstm(window)['Bid Price Closed'].tail(1).iloc[0]:
+        return 'green'
+    else:
+        return 'red'
+
+    
+def trade(window,way,n=3, units=10):#'M5', 'M10', ;'RNN','KNN'; 100
+    accountID = '101-001-11847054-001'
+    access_token="3c247797cbba6a94f8b19499c50dbee2-7dcfd0a4cde2a91e1eb79eceece13fcd"
+    client=API(access_token=access_token)
+    instrument = 'EUR_USD'
+    if way == 'RNN':
+        if signal(window) == 'green': #buy eur
+            mo = MarketOrderRequest(instrument=instrument, units=units)
+        else:#buy usd
+            mo = MarketOrderRequest(instrument=instrument, units=-units)
+    elif way == 'KNN':
+        if knn(n, window) == 'green': #buy eur
+            mo = MarketOrderRequest(instrument=instrument, units=units)
+        else:#buy usd
+            mo = MarketOrderRequest(instrument=instrument, units=-units)
+    else:
+        print('Wrong Input')
+    r = orders.OrderCreate(accountID, data=mo.data)
+    rv = client.request(r)
+    print(r)
+    print(json.dumps(rv, indent = 4))
+
+def periodtrade(window, looptime, way, units=10, n=3):#'M5'(3,4,5,10,15), second, 'RNN'/'KNN', 
+    accountID = '101-001-11847054-001'
+    access_token="3c247797cbba6a94f8b19499c50dbee2-7dcfd0a4cde2a91e1eb79eceece13fcd"
+    client=API(access_token=access_token)
+    instrument = 'EUR_USD'
+    num = 1
+    if window == 'M3':
+        windowtime = 3*60
+        loopnum = round(looptime/windowtime)
+        while num <= loopnum:
+            if way == 'RNN':
+                if signal(window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            elif way == 'KNN':
+                if knn(n, window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            else:
+                print('Wrong Input')
+            r = orders.OrderCreate(accountID, data=mo.data)
+            rv = client.request(r)
+            tradeid = rv['orderFillTransaction']['tradeOpened']['tradeID']
+            time.sleep(windowtime+1)
+            c = trades.TradeClose(accountID, tradeid)
+            client.request(c)
+            num += 1
+    elif window == 'M4':
+        windowtime = 4*60
+        loopnum = round(looptime/windowtime)
+        while num <= loopnum:
+            if way == 'RNN':
+                if signal(window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            elif way == 'KNN':
+                if knn(n, window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            else:
+                print('Wrong Input')
+            r = orders.OrderCreate(accountID, data=mo.data)
+            rv = client.request(r)
+            tradeid = rv['orderFillTransaction']['tradeOpened']['tradeID']
+            time.sleep(windowtime+1)
+            c = trades.TradeClose(accountID, tradeid)
+            client.request(c)
+            num += 1
+    elif window == 'M5':
+        windowtime = 5*60
+        loopnum = round(looptime/windowtime)
+        while num <= loopnum:
+            if way == 'RNN':
+                if signal(window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            elif way == 'KNN':
+                if knn(n, window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            else:
+                print('Wrong Input')
+            r = orders.OrderCreate(accountID, data=mo.data)
+            rv = client.request(r)
+            tradeid = rv['orderFillTransaction']['tradeOpened']['tradeID']
+            time.sleep(windowtime+1)
+            c = trades.TradeClose(accountID, tradeid)
+            client.request(c)
+            num += 1
+    elif window == 'M10':
+        windowtime = 10*60
+        loopnum = round(looptime/windowtime)
+        while num <= loopnum:
+            if way == 'RNN':
+                if signal(window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            elif way == 'KNN':
+                if knn(n, window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            else:
+                print('Wrong Input')
+            r = orders.OrderCreate(accountID, data=mo.data)
+            rv = client.request(r)
+            tradeid = rv['orderFillTransaction']['tradeOpened']['tradeID']
+            time.sleep(windowtime+1)
+            c = trades.TradeClose(accountID, tradeid)
+            client.request(c)
+            num += 1
+    elif window == 'M15':
+        windowtime = 15*60
+        loopnum = round(looptime/windowtime)
+        while num <= loopnum:
+            if way == 'RNN':
+                if signal(window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            elif way == 'KNN':
+                if knn(n, window) == 'green': #buy eur
+                    mo = MarketOrderRequest(instrument=instrument, units=units)
+                else:#buy usd
+                    mo = MarketOrderRequest(instrument=instrument, units=-units)
+            else:
+                print('Wrong Input')
+            r = orders.OrderCreate(accountID, data=mo.data)
+            rv = client.request(r)
+            tradeid = rv['orderFillTransaction']['tradeOpened']['tradeID']
+            time.sleep(windowtime+1)
+            c = trades.TradeClose(accountID, tradeid)
+            client.request(c)
+            num += 1
+    else:
+        print('Wrong window input please input M3,M4,M5,M10,M15')
+    
+    a = accounts.AccountSummary(accountID)
+    client.request(a)
+    print(a.response)
+            
+            
+    
+    
+    
+    
+    
