@@ -1,0 +1,168 @@
+# Blackjack
+import random
+from random import choice, sample
+
+
+class cardgame:
+    def __init__(self, carddesk, card, dealer_cards, player_cards):
+        self.__carddesk = carddesk
+        self.card = card
+        self.dealer_cards = dealer_cards
+        self.player_cards = player_cards
+        
+    def __repr__(self):
+        return "What's left in carddesk=%carddesk, card=%card, dealer_cards=%dealer_cards, player_cards=%player_cards" % (self.__carddesk, self.card, self.dealer_cards, self.player_cards) 
+         
+    def newcarddesk(self, carddesk, card):
+        carddesk.remove(card)
+        
+    def addcarddealer(self, card, dealer_cards):
+        dealer_cards.append(card)
+        
+    def addcardplayer(self, card, player_cards):
+        player_cards.append(card)
+        
+    def getCarddesk(self):
+        return self.__carddesk
+    
+def printrecord():
+    print('Do you like to print out a record of your game? (Yes / No)')
+    return input().upper().startswith('Y')    
+        
+
+def BlackJack():
+    
+    welcomewordslist = {"Let's play BLACKJACK!", "Did you BLACKJACK before?", "21 is BLACKJACK", "BLACKJACK is 21"} #set
+    welcome = sample(list(welcomewordslist), 1)[0]
+    print(welcome)
+    
+    charaternames = {1:'Callum' , 2:'Jacob', 3:'Bethany', 4:'Elizabeth'} # dic
+    number = ""
+    while number not in [1, 2, 3, 4]:
+        print('Who would you like to help with: 1)Callum 2)Jacob 3)Bethany 4)Elizabeth (1-4)')
+        number = int(input())
+        Name = charaternames.get(number)
+    print("You choose to help " + Name + " by using the money you won from BLACKJACK")
+    
+    winword = (" Victory!","Well done!", "You win and give your winning moeny to the one you are trying to help.", "You win and have enough money to buy a bus now.")
+    losword = ("You lose and have no money to take bus.", "Dealer wins!", "You lose.", "You lose and the one who you are trying to help is so disappointed on you!")#tuple
+    
+    
+    carddesk = [2,3,4,5,6,7,8,9,10,10,10,10,11,
+                2,3,4,5,6,7,8,9,10,10,10,10,11,
+                2,3,4,5,6,7,8,9,10,10,10,10,11,
+                2,3,4,5,6,7,8,9,10,10,10,10,11]
+    c = cardgame(carddesk, '', [], [])
+    card = []
+    dealer_cards = []
+    player_cards = []
+    
+    while len(dealer_cards) != 2:
+        card = choice(carddesk)
+        c.newcarddesk(carddesk, card)
+        c.addcarddealer(card, dealer_cards)
+        if len(dealer_cards) == 2:
+            if sum(dealer_cards) == 21:
+                l = random.choice(losword)
+                print("Dealer has BLACKJACK! Dealer wins!")
+                print(l)
+                break
+            else:
+                print("Dealer has x &", dealer_cards[1])
+    
+    while len(player_cards) != 2:
+        card = choice(carddesk)
+        c.newcarddesk(carddesk, card)
+        c.addcarddealer(card, player_cards)
+        if len(player_cards) == 2:
+            print("You have", player_cards)
+                    
+    while sum(player_cards) < 21:
+        action_1 = str(input("Hit or Stand ?" ))
+        input_1 = action_1.upper()
+        
+        if input_1 == "HIT":
+            card = choice(carddesk)
+            c.newcarddesk(carddesk, card)
+            c.addcardplayer(card, player_cards)
+            print("You now have these cards : ", player_cards)
+            
+        elif input_1 == "STAND":
+            print("The total of your cards is : ", sum(player_cards))
+        
+            while sum(dealer_cards) < 16:
+                card = choice(carddesk)
+                c.newcarddesk(carddesk, card)
+                c.addcarddealer(card, dealer_cards)
+                print("Dealer has ", dealer_cards)
+            
+            if sum(dealer_cards) > 21:
+                dealer_cards = [x if x!=11 else 1 for x in dealer_cards]
+                print("Dealer had busted and truned A from 11 to 1")
+                print("Dealer has ", dealer_cards)
+                
+                while sum(dealer_cards) < 16:
+                    card = choice(carddesk)
+                    c.newcarddesk(carddesk, card)
+                    c.addcarddealer(card, dealer_cards)
+                    print("Dealer has ", dealer_cards)
+                            
+            
+            if sum(dealer_cards) > sum(player_cards):
+                print("Dealer has ", dealer_cards)
+                
+                if sum(dealer_cards) <= 21:
+                    l = random.choice(losword)
+                    print("The total of dealer cards ", dealer_cards, " is ", sum(dealer_cards))
+                    print(l)
+                    break
+                else:
+                    w = random.choice(winword)
+                    print("The total of dealer cards ", dealer_cards, " is ", sum(dealer_cards))
+                    print(w)
+                    z = printrecord()
+                    if z == True:
+                        f = open('BLACKJACK.txt', 'w')
+                        print("Thank you for palying BLACKJACK and you beat {}".format(Name), file = f)
+                        f.close()
+                    break
+            
+            elif sum(dealer_cards) == sum(player_cards):
+                print("The total of dealer cards ", dealer_cards, " is ", sum(dealer_cards))
+                print("Draw")
+                break
+            
+            else:
+                w = random.choice(winword)
+                print("The total of dealer cards ", dealer_cards, " is ", sum(dealer_cards))
+                print(w)
+                z = printrecord()
+                if z == True:
+                    f = open('BLACKJACK.txt', 'w')
+                    print("Thank you for palying BLACKJACK and you beat {}".format(Name), file = f)
+                    f.close()
+                break
+        
+        else:
+            print("Invalid entry")
+    
+    if sum(player_cards) > 21:
+        l = random.choice(losword)
+        print("You have busted.")
+        print(l)
+        
+        
+    elif sum(player_cards) == 21:
+        print("You have BLACKJACK!")
+        if sum(dealer_cards) != 21:
+            w = random.choice(winword)
+            print("The total of dealer cards ", dealer_cards, " is ", sum(dealer_cards))
+            print(w)
+            z = printrecord()
+            if z == True:
+                f = open('BLACKJACK.txt', 'w')
+                print("Thank you for palying BLACKJACK and you beat {}".format(Name), file = f)
+                f.close()
+        else:
+            print("The total of dealer cards ", dealer_cards, " is ", sum(dealer_cards))
+            print("Both dealer and you have BLACKJACK so dealer win.")
