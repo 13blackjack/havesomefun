@@ -1,0 +1,1199 @@
+import pandas as pd
+import numpy as np
+import json
+import time
+import sys
+
+from statistics import mean 
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import classification_report
+from sklearn.model_selection import GridSearchCV,cross_validate
+from sklearn.metrics import confusion_matrix
+
+from datetime import datetime, timedelta
+from threading import Timer
+
+
+from oandapyV20 import API
+import oandapyV20.endpoints.instruments as instruments
+from oandapyV20.contrib.requests import MarketOrderRequest
+import oandapyV20.endpoints.orders as orders
+import oandapyV20.endpoints.accounts as accounts
+import oandapyV20.endpoints.trades as trades
+from oandapyV20.contrib.requests import StopLossOrderRequest
+import oandapyV20.endpoints.pricing as pricing
+
+
+class account():
+    accountID_Primary = '...'
+    account_1 = '...'
+    account_2 = '...'
+    account_3 = '...'
+    account_4 = '...'
+    access_token="..."
+    instrument='...'
+
+def seperate_old(data, old):
+  seperate_line=round(len(data)* old)
+  old_set= data.loc[0:seperate_line]
+  return old_set
+
+def seperate_new(data, old):
+  seperate_line=round(len(data)* old)
+  new_set= data.loc[seperate_line+1: len(data)]
+  return new_set
+
+def cal_EMA(data, n):
+    EMA_list=[np.nan]*(n-1)
+    analysis_period=data.iloc[0:n]
+    first_EMA = sum(analysis_period)/n
+    EMA_list.append(first_EMA)
+    for i in range(n, len(data), 1):
+        multiplier = 2/(n+1)
+        current_EMA = (data.iloc[i]- EMA_list[i-1])*multiplier + EMA_list[i-1]
+        EMA_list.append(current_EMA)
+    return EMA_list
+
+def find_up_or_down(days_ahead, gap_value, data):
+    up_or_down=[]
+    for a in range(0, len(data)-days_ahead, 1):
+        if data['Close'][a+ days_ahead] - data['Close'][a] < -gap_value:
+            up_or_down.append(1)
+        else:
+            up_or_down.append(0)
+    up_or_down.extend([np.nan]*days_ahead)
+    return up_or_down
+
+def opentrade(accountID,instrument,units,client,stoploss,actionid):
+    try:
+        api = API(access_token=account.access_token)
+        params = {"instruments": "AUD_USD"}
+        r = pricing.PricingInfo(accountID=accountID, params=params)
+        rv = api.request(r)
+        current_price_1 = float(rv['prices'][0]['closeoutAsk'])
+        r = pricing.PricingInfo(accountID=accountID, params=params)
+        rv = api.request(r)
+        current_price_2 = float(rv['prices'][0]['closeoutAsk'])
+    except:
+        print('Fail to access market price.')
+        
+    if current_price_2-current_price_1 > 0.0010:
+        print('Too much volatility, no trade')
+    else:
+        mo = MarketOrderRequest(instrument=instrument, units=-units)
+        r = orders.OrderCreate(accountID, data=mo.data)
+        rv = client.request(r)
+        tradeid = rv['orderFillTransaction']['tradeOpened']['tradeID']
+        tradeprice = float(rv['orderFillTransaction']['tradeOpened']['price']) + stoploss
+        ordr = StopLossOrderRequest(tradeID=tradeid, price=tradeprice)
+        r = orders.OrderCreate(accountID = accountID, data=ordr.data)
+        rv = client.request(r)
+        print(rv)
+        print('Predicted Result: Short, opened trade in account {}'.format(actionid))
+    
+    
+def closetrade(accountID,client,actionid):
+    r = trades.OpenTrades(accountID=accountID)
+    rv = client.request(r)
+    tradeid = rv['trades'][0]['id']
+    c = trades.TradeClose(accountID=accountID, tradeID=tradeid)
+    cv = client.request(c)
+    print(cv)
+    print('Closed trade in account {}'.format(actionid))
+    
+
+##DATA
+#window: 'D','H4','M5'
+#windows_ahead: 3
+def data_train_D(window,days_ahead):
+    client=API(access_token=account.access_token)
+    params={ 'count':5000,"granularity":window,'from':"2005-01-01T00:00:00Z"}#2005-01-01
+    r = instruments.InstrumentsCandles(instrument=account.instrument, params = params)
+    dataset = client.request(r)
+    timelist = []
+    o = []
+    c = []
+    h = []
+    l = []
+    v = []
+    for i in range(len(dataset['candles'])):
+        if dataset['candles'][i]['complete'] == True:
+            timelist.append(datetime.strptime(dataset['candles'][i]['time'][:-4],'%Y-%m-%dT%H:%M:%S.%f'))
+            o.append(float(dataset['candles'][i]['mid']['o']))
+            c.append(float(dataset['candles'][i]['mid']['c']))
+            h.append(float(dataset['candles'][i]['mid']['h']))
+            l.append(float(dataset['candles'][i]['mid']['l']))
+            v.append(float(dataset['candles'][i]['volume']))   
+    title={'Time':timelist,'Open':o,'Close':c,'High':h,'Low':l,'Volume':v}
+    data=pd.DataFrame(title)
+    data = data[data.Volume >= 10]
+    data.index= np.arange(0, len(data))
+    #prepare
+    data['ocd'] = data['Open']- data['Close']
+    data['hld'] = data['High'] - data['Low']
+    up_or_down= find_up_or_down(days_ahead, 0.0010, data)
+    close = data['Close']
+    EMAone= pd.Series(cal_EMA(close, 12), name= 'EMA12')
+    EMAtwo= pd.Series(cal_EMA(close, 26), name= 'EMA26')
+    macd = pd.Series(EMAone- EMAtwo, name= 'MACD')
+    signal= [np.nan]*25
+    macd_test=macd[25:len(macd)]
+    signal.extend(cal_EMA(macd_test, 9))
+    signal= pd.Series(signal, name= 'signal')
+    histogram= pd.Series(macd - signal, name= 'histogram')
+    
+    klist= [np.nan]* (11-1)
+    for i in range(10, len(data), 1):
+        high = max(data['High'][i-10:i])
+        low = min(data['Low'][i-10:i])
+        k = ((data['Close'][i]- low)/(high - low)) * 100
+        klist.append(k)
+    fullk_list= [np.nan]*(11+5-1-1)
+    for a in range(14, len(data), 1):
+        fullk= mean(klist[a-4:a])
+        fullk_list.append(fullk)
+    fulld_list= [np.nan]*(11+5+5-1-1-1)
+    for b in range(18, len(data), 1):
+        fulld= mean(fullk_list[b-4:b])
+        fulld_list.append(fulld)    
+
+    data['EMA12']= EMAone
+    data['EMA26']= EMAtwo
+    data['MACD']= macd
+    data['signal']= signal
+    data['histogram'] = histogram
+    data['full%k'] = fullk_list
+    data['full%d'] = fulld_list
+    data['up_or_down'] = up_or_down
+    data = data.dropna()
+    data.index= np.arange(0, len(data))
+    
+    return data
+
+def data_train_H(window,days_ahead):
+    client=API(access_token=account.access_token)
+    params={ 'count':5000,"granularity":window}
+    r = instruments.InstrumentsCandles(instrument=account.instrument, params = params)
+    dataset = client.request(r)
+    timelist = []
+    o = []
+    c = []
+    h = []
+    l = []
+    v = []
+    for i in range(len(dataset['candles'])):
+        if dataset['candles'][i]['complete'] == True:
+            timelist.append(datetime.strptime(dataset['candles'][i]['time'][:-4],'%Y-%m-%dT%H:%M:%S.%f'))
+            o.append(float(dataset['candles'][i]['mid']['o']))
+            c.append(float(dataset['candles'][i]['mid']['c']))
+            h.append(float(dataset['candles'][i]['mid']['h']))
+            l.append(float(dataset['candles'][i]['mid']['l']))
+            v.append(float(dataset['candles'][i]['volume']))   
+    title={'Time':timelist,'Open':o,'Close':c,'High':h,'Low':l,'Volume':v}
+    data=pd.DataFrame(title)
+    data = data[data.Volume >= 10]
+    data.index= np.arange(0, len(data))
+    #prepare
+    data['ocd'] = data['Open']- data['Close']
+    data['hld'] = data['High'] - data['Low']
+    up_or_down= find_up_or_down(days_ahead, 0.0010, data)
+    close = data['Close']
+    EMAone= pd.Series(cal_EMA(close, 12), name= 'EMA12')
+    EMAtwo= pd.Series(cal_EMA(close, 26), name= 'EMA26')
+    macd = pd.Series(EMAone- EMAtwo, name= 'MACD')
+    signal= [np.nan]*25
+    macd_test=macd[25:len(macd)]
+    signal.extend(cal_EMA(macd_test, 9))
+    signal= pd.Series(signal, name= 'signal')
+    histogram= pd.Series(macd - signal, name= 'histogram')
+    
+    klist= [np.nan]* (11-1)
+    for i in range(10, len(data), 1):
+        high = max(data['High'][i-10:i])
+        low = min(data['Low'][i-10:i])
+        k = ((data['Close'][i]- low)/(high - low)) * 100
+        klist.append(k)
+    fullk_list= [np.nan]*(11+5-1-1)
+    for a in range(14, len(data), 1):
+        fullk= mean(klist[a-4:a])
+        fullk_list.append(fullk)
+    fulld_list= [np.nan]*(11+5+5-1-1-1)
+    for b in range(18, len(data), 1):
+        fulld= mean(fullk_list[b-4:b])
+        fulld_list.append(fulld)    
+
+    data['EMA12']= EMAone
+    data['EMA26']= EMAtwo
+    data['MACD']= macd
+    data['signal']= signal
+    data['histogram'] = histogram
+    data['full%k'] = fullk_list
+    data['full%d'] = fulld_list
+    data['up_or_down'] = up_or_down
+    data = data.dropna()
+    data.index= np.arange(0, len(data))
+    
+    return data
+
+def data_input_D(window):
+    client=API(access_token=account.access_token)
+    params={ 'count':5000,"granularity":window,'from':"2005-01-01T00:00:00Z"}#2005-01-01
+    r = instruments.InstrumentsCandles(instrument=account.instrument, params = params)
+    dataset = client.request(r)
+    timelist = []
+    o = []
+    c = []
+    h = []
+    l = []
+    v = []
+    for i in range(len(dataset['candles'])):
+        timelist.append(datetime.strptime(dataset['candles'][i]['time'][:-4],'%Y-%m-%dT%H:%M:%S.%f'))
+        o.append(float(dataset['candles'][i]['mid']['o']))
+        c.append(float(dataset['candles'][i]['mid']['c']))
+        h.append(float(dataset['candles'][i]['mid']['h']))
+        l.append(float(dataset['candles'][i]['mid']['l']))
+        v.append(float(dataset['candles'][i]['volume']))   
+    title={'Time':timelist,'Open':o,'Close':c,'High':h,'Low':l,'Volume':v}
+    data=pd.DataFrame(title)
+    data = data[data.Volume >= 10]
+    data.index= np.arange(0, len(data))
+    #prepare
+    data['ocd'] = data['Open']- data['Close']
+    data['hld'] = data['High'] - data['Low']
+    close = data['Close']
+    EMAone= pd.Series(cal_EMA(close, 12), name= 'EMA12')
+    EMAtwo= pd.Series(cal_EMA(close, 26), name= 'EMA26')
+    macd = pd.Series(EMAone- EMAtwo, name= 'MACD')
+    signal= [np.nan]*25
+    macd_test=macd[25:len(macd)]
+    signal.extend(cal_EMA(macd_test, 9))
+    signal= pd.Series(signal, name= 'signal')
+    histogram= pd.Series(macd - signal, name= 'histogram')
+    
+    klist= [np.nan]* (11-1)
+    for i in range(10, len(data), 1):
+        high = max(data['High'][i-10:i])
+        low = min(data['Low'][i-10:i])
+        k = ((data['Close'][i]- low)/(high - low)) * 100
+        klist.append(k)
+    fullk_list= [np.nan]*(11+5-1-1)
+    for a in range(14, len(data), 1):
+        fullk= mean(klist[a-4:a])
+        fullk_list.append(fullk)
+    fulld_list= [np.nan]*(11+5+5-1-1-1)
+    for b in range(18, len(data), 1):
+        fulld= mean(fullk_list[b-4:b])
+        fulld_list.append(fulld)    
+
+    data['EMA12']= EMAone
+    data['EMA26']= EMAtwo
+    data['MACD']= macd
+    data['signal']= signal
+    data['histogram'] = histogram
+    data['full%k'] = fullk_list
+    data['full%d'] = fulld_list
+    
+    data = data[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+    data = data.dropna()
+    data.index= np.arange(0, len(data))
+    return data
+
+def data_input_H(window):
+    client=API(access_token=account.access_token)
+    params={ 'count':5000,"granularity":window}
+    r = instruments.InstrumentsCandles(instrument=account.instrument, params = params)
+    dataset = client.request(r)
+    timelist = []
+    o = []
+    c = []
+    h = []
+    l = []
+    v = []
+    for i in range(len(dataset['candles'])):
+        timelist.append(datetime.strptime(dataset['candles'][i]['time'][:-4],'%Y-%m-%dT%H:%M:%S.%f'))
+        o.append(float(dataset['candles'][i]['mid']['o']))
+        c.append(float(dataset['candles'][i]['mid']['c']))
+        h.append(float(dataset['candles'][i]['mid']['h']))
+        l.append(float(dataset['candles'][i]['mid']['l']))
+        v.append(float(dataset['candles'][i]['volume']))   
+    title={'Time':timelist,'Open':o,'Close':c,'High':h,'Low':l,'Volume':v}
+    data=pd.DataFrame(title)
+    data = data[data.Volume >= 10]
+    data.index= np.arange(0, len(data))
+    #prepare
+    data['ocd'] = data['Open']- data['Close']
+    data['hld'] = data['High'] - data['Low']
+    close = data['Close']
+    EMAone= pd.Series(cal_EMA(close, 12), name= 'EMA12')
+    EMAtwo= pd.Series(cal_EMA(close, 26), name= 'EMA26')
+    macd = pd.Series(EMAone- EMAtwo, name= 'MACD')
+    signal= [np.nan]*25
+    macd_test=macd[25:len(macd)]
+    signal.extend(cal_EMA(macd_test, 9))
+    signal= pd.Series(signal, name= 'signal')
+    histogram= pd.Series(macd - signal, name= 'histogram')
+    
+    klist= [np.nan]* (11-1)
+    for i in range(10, len(data), 1):
+        high = max(data['High'][i-10:i])
+        low = min(data['Low'][i-10:i])
+        k = ((data['Close'][i]- low)/(high - low)) * 100
+        klist.append(k)
+    fullk_list= [np.nan]*(11+5-1-1)
+    for a in range(14, len(data), 1):
+        fullk= mean(klist[a-4:a])
+        fullk_list.append(fullk)
+    fulld_list= [np.nan]*(11+5+5-1-1-1)
+    for b in range(18, len(data), 1):
+        fulld= mean(fullk_list[b-4:b])
+        fulld_list.append(fulld)    
+
+    data['EMA12']= EMAone
+    data['EMA26']= EMAtwo
+    data['MACD']= macd
+    data['signal']= signal
+    data['histogram'] = histogram
+    data['full%k'] = fullk_list
+    data['full%d'] = fulld_list
+    
+    data = data[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+    data = data.dropna()
+    data.index= np.arange(0, len(data))
+    return data
+
+##model
+#data:training data -- data_train(window,days_ahead)
+#X_input:data used for prediction -- data_input(window)
+def XGBX(data, random_state=7):
+    old_list=seperate_old(data, 0.7)
+    new_list=seperate_new(data, 0.7)
+    
+    X_new = new_list[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+    Y_new = new_list['up_or_down']
+    X_old = old_list[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+    Y_old = old_list['up_or_down']
+    
+    test_sizeo = 1- 0.6572
+    X_traino, X_testo, y_traino, y_testo = train_test_split(X_old, Y_old, test_size=test_sizeo, random_state=random_state)
+    
+    test_sizen = 1- 0.8
+    X_trainn, X_testn, y_trainn, y_testn = train_test_split(X_new, Y_new, test_size=test_sizen, random_state=random_state)
+    
+    X_train= X_traino.append(X_trainn)
+    y_train= y_traino.append(y_trainn)
+    '''
+    X_test= X_testo.append(X_testn)
+    y_test= y_testo.append(y_testn)
+    '''
+    
+    n_estimators_list=[1,250,500,750,1000,1250,1500,1750,2000,2250,2500,2750,3000,3250]
+    param_grid_0 = {'n_estimators': n_estimators_list}
+    param_grid_2 = {'max_depth':[1,2,3,4,5,6,7,8,9,10],
+                  'min_child_weight':[1,2,3,4,5]}
+    param_grid_3 = {'gamma':[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}
+    param_grid_4 = {'subsample':[0.5,0.6,0.7,0.8,0.9,1.0],
+                  'colsample_bytree':[0.7,0.8,0.9,1.0]}
+    param_grid_5 = {'reg_alpha': [0.0, 0.1, 0.2, 0.3, 0.4],
+                  'reg_lambda': [0.5,0.6, 0.7, 0.8, 0.9, 1]}
+    param_grid_6 = {'learning_rate': [0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15]}
+    
+    model_0= XGBClassifier()
+    model_0.fit(X_train, y_train)
+    optimized_GBM_0 = GridSearchCV(estimator=model_0, param_grid=param_grid_0, scoring='roc_auc', cv=5, verbose=1, n_jobs=8)
+    optimized_GBM_0.fit(X_train, y_train)
+    params_0=optimized_GBM_0.best_params_
+    print('Performance after initial adjustment:{}'.format(optimized_GBM_0.best_score_))
+    
+    params_num = int(params_0['n_estimators'])
+    n_estimators_list=list(range(params_num-250, params_num+251))
+    param_grid_1 = {'n_estimators': n_estimators_list}
+    model_1= XGBClassifier()
+    model_1.fit(X_train, y_train)
+    optimized_GBM_1 = GridSearchCV(estimator=model_1, param_grid=param_grid_1, scoring='roc_auc', cv=5, verbose=1, n_jobs=8)
+    optimized_GBM_1.fit(X_train, y_train)
+    params_1=optimized_GBM_1.best_params_
+    print('Performance after first adjustment:{}'.format(optimized_GBM_1.best_score_))
+    
+    model_2= XGBClassifier(n_estimators=params_1['n_estimators'])
+    model_2.fit(X_train, y_train)
+    optimized_GBM_2 = GridSearchCV(estimator=model_2, param_grid=param_grid_2, scoring='roc_auc', cv=5, verbose=1, n_jobs=8)
+    optimized_GBM_2.fit(X_train, y_train)
+    params_2=optimized_GBM_2.best_params_
+    print('Performance after second adjustment:{}'.format(optimized_GBM_2.best_score_))
+    
+    model_3= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'])
+    model_3.fit(X_train, y_train)
+    optimized_GBM_3 = GridSearchCV(estimator=model_3, param_grid=param_grid_3, scoring='roc_auc', cv=5, verbose=1, n_jobs=8)
+    optimized_GBM_3.fit(X_train, y_train)
+    params_3=optimized_GBM_3.best_params_
+    print('Performance after third adjustment:{}'.format(optimized_GBM_3.best_score_))
+    
+    model_4= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'])
+    model_4.fit(X_train, y_train)
+    optimized_GBM_4 = GridSearchCV(estimator=model_4, param_grid=param_grid_4, scoring='roc_auc', cv=5, verbose=1, n_jobs=8)
+    optimized_GBM_4.fit(X_train, y_train)
+    params_4=optimized_GBM_4.best_params_
+    print('Performance after fourth adjustment:{}'.format(optimized_GBM_4.best_score_))
+    
+    model_5= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'],
+                           subsample=params_4['subsample'],
+                           colsample_bytree=params_4['colsample_bytree'])
+    model_5.fit(X_train, y_train)
+    optimized_GBM_5 = GridSearchCV(estimator=model_5, param_grid=param_grid_5, scoring='roc_auc', cv=5, verbose=1, n_jobs=8)
+    optimized_GBM_5.fit(X_train, y_train)
+    params_5=optimized_GBM_5.best_params_
+    print('Performance after fifth adjustment:{}'.format(optimized_GBM_5.best_score_))
+    
+    model_6= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'],
+                           subsample=params_4['subsample'],
+                           colsample_bytree=params_4['colsample_bytree'],
+                           reg_alpha=params_5['reg_alpha'],
+                           reg_lambda=params_5['reg_lambda'])
+    model_6.fit(X_train, y_train)
+    optimized_GBM_6 = GridSearchCV(estimator=model_6, param_grid=param_grid_6, scoring='roc_auc', cv=5, verbose=1, n_jobs=8)
+    optimized_GBM_6.fit(X_train, y_train)
+    params_6=optimized_GBM_6.best_params_
+    print('Performance after final adjustment:{}'.format(optimized_GBM_6.best_score_))
+    
+    model_7= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'],
+                           subsample=params_4['subsample'],
+                           colsample_bytree=params_4['colsample_bytree'],
+                           reg_alpha=params_5['reg_alpha'],
+                           reg_lambda=params_5['reg_lambda'],
+                           learning_rate=params_6['learning_rate'])
+    
+    return model_7
+
+
+def XGBX_pre(data, X_input, days_ahead=3, random_state=7, whole='N'):
+    if whole == 'N':
+        old_list=seperate_old(data, 0.7)
+        new_list=seperate_new(data, 0.7)
+        
+        X_new = new_list[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+        Y_new = new_list['up_or_down']
+        X_old = old_list[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+        Y_old = old_list['up_or_down']
+        
+        test_sizeo = 1- 0.6572
+        X_traino, X_testo, y_traino, y_testo = train_test_split(X_old, Y_old, test_size=test_sizeo, random_state=random_state)
+        
+        test_sizen = 1- 0.8
+        X_trainn, X_testn, y_trainn, y_testn = train_test_split(X_new, Y_new, test_size=test_sizen, random_state=random_state)
+        
+        X_train= X_traino.append(X_trainn)
+        y_train= y_traino.append(y_trainn)
+        '''
+        X_test= X_testo.append(X_testn)
+        y_test= y_testo.append(y_testn)
+        '''
+    else:
+        X_train = data[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+        y_train = data['up_or_down']
+    
+    n_estimators_list=[1,250,500,750,1000,1250,1500,1750,2000,2250,2500,2750,3000,3250]
+    param_grid_0 = {'n_estimators': n_estimators_list}
+    
+    param_grid_2 = {'max_depth':[1,2,3,4,5,6,7,8,9,10],
+                  'min_child_weight':[1,2,3,4,5]}
+    param_grid_3 = {'gamma':[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}
+    param_grid_4 = {'subsample':[0.5,0.6,0.7,0.8,0.9,1.0],
+                  'colsample_bytree':[0.7,0.8,0.9,1.0]}
+    param_grid_5 = {'reg_alpha': [0.0, 0.1, 0.2, 0.3, 0.4],
+                  'reg_lambda': [0.5,0.6, 0.7, 0.8, 0.9, 1]}
+    param_grid_6 = {'learning_rate': [0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15]}
+    
+    model_0= XGBClassifier()
+    model_0.fit(X_train, y_train)
+    optimized_GBM_0 = GridSearchCV(estimator=model_0, param_grid=param_grid_0, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_0.fit(X_train, y_train)
+    params_0=optimized_GBM_0.best_params_
+    print('Performance after initial adjustment:{}'.format(optimized_GBM_0.best_score_))
+    
+    params_num = int(params_0['n_estimators'])
+    n_estimators_list=list(range(params_num-250, params_num+251))
+    param_grid_1 = {'n_estimators': n_estimators_list}
+    model_1= XGBClassifier()
+    model_1.fit(X_train, y_train)
+    optimized_GBM_1 = GridSearchCV(estimator=model_1, param_grid=param_grid_1, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_1.fit(X_train, y_train)
+    params_1=optimized_GBM_1.best_params_
+    print('Performance after first adjustment:{}'.format(optimized_GBM_1.best_score_))
+    
+    model_2= XGBClassifier(n_estimators=params_1['n_estimators'])
+    model_2.fit(X_train, y_train)
+    optimized_GBM_2 = GridSearchCV(estimator=model_2, param_grid=param_grid_2, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_2.fit(X_train, y_train)
+    params_2=optimized_GBM_2.best_params_
+    print('Performance after second adjustment:{}'.format(optimized_GBM_2.best_score_))
+    
+    model_3= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'])
+    model_3.fit(X_train, y_train)
+    optimized_GBM_3 = GridSearchCV(estimator=model_3, param_grid=param_grid_3, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_3.fit(X_train, y_train)
+    params_3=optimized_GBM_3.best_params_
+    print('Performance after third adjustment:{}'.format(optimized_GBM_3.best_score_))
+    
+    model_4= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'])
+    model_4.fit(X_train, y_train)
+    optimized_GBM_4 = GridSearchCV(estimator=model_4, param_grid=param_grid_4, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_4.fit(X_train, y_train)
+    params_4=optimized_GBM_4.best_params_
+    print('Performance after fourth adjustment:{}'.format(optimized_GBM_4.best_score_))
+    
+    model_5= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'],
+                           subsample=params_4['subsample'],
+                           colsample_bytree=params_4['colsample_bytree'])
+    model_5.fit(X_train, y_train)
+    optimized_GBM_5 = GridSearchCV(estimator=model_5, param_grid=param_grid_5, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_5.fit(X_train, y_train)
+    params_5=optimized_GBM_5.best_params_
+    print('Performance after fifth adjustment:{}'.format(optimized_GBM_5.best_score_))
+    
+    model_6= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'],
+                           subsample=params_4['subsample'],
+                           colsample_bytree=params_4['colsample_bytree'],
+                           reg_alpha=params_5['reg_alpha'],
+                           reg_lambda=params_5['reg_lambda'])
+    model_6.fit(X_train, y_train)
+    optimized_GBM_6 = GridSearchCV(estimator=model_6, param_grid=param_grid_6, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_6.fit(X_train, y_train)
+    print('Performance after final adjustment:{}'.format(optimized_GBM_6.best_score_))
+    
+    y_pred = optimized_GBM_6.predict(X_input)
+    
+    return y_pred[len(y_pred)-1]
+
+def test_XGB(data, days_ahead=3, random_state=7):
+    old_list=seperate_old(data, 0.7)
+    new_list=seperate_new(data, 0.7)
+    
+    X_new = new_list[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+    Y_new = new_list['up_or_down']
+    X_old = old_list[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
+    Y_old = old_list['up_or_down']
+    
+    test_sizeo = 1- 0.6572
+    X_traino, X_testo, y_traino, y_testo = train_test_split(X_old, Y_old, test_size=test_sizeo, random_state=random_state)
+    
+    test_sizen = 1- 0.8
+    X_trainn, X_testn, y_trainn, y_testn = train_test_split(X_new, Y_new, test_size=test_sizen, random_state=random_state)
+    
+    X_train= X_traino.append(X_trainn)
+    y_train= y_traino.append(y_trainn)
+    X_test= X_testo.append(X_testn)
+    y_test= y_testo.append(y_testn)
+    
+    n_estimators_list=[1,250,500,750,1000,1250,1500,1750,2000,2250,2500,2750,3000,3250]
+    param_grid_0 = {'n_estimators': n_estimators_list}
+    param_grid_2 = {'max_depth':[1,2,3,4,5,6,7,8,9,10],
+                  'min_child_weight':[1,2,3,4,5]}
+    param_grid_3 = {'gamma':[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}
+    param_grid_4 = {'subsample':[0.5,0.6,0.7,0.8,0.9,1.0],
+                  'colsample_bytree':[0.7,0.8,0.9,1.0]}
+    param_grid_5 = {'reg_alpha': [0.0, 0.1, 0.2, 0.3, 0.4],
+                  'reg_lambda': [0.5,0.6, 0.7, 0.8, 0.9, 1]}
+    param_grid_6 = {'learning_rate': [0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15]}
+    
+    model_0= XGBClassifier()
+    model_0.fit(X_train, y_train)
+    optimized_GBM_0 = GridSearchCV(estimator=model_0, param_grid=param_grid_0, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_0.fit(X_train, y_train)
+    params_0=optimized_GBM_0.best_params_
+    print('Performance after initial adjustment:{}'.format(optimized_GBM_0.best_score_))
+    
+    params_num = int(params_0['n_estimators'])
+    n_estimators_list=list(range(params_num-250, params_num+251))
+    param_grid_1 = {'n_estimators': n_estimators_list}
+    model_1= XGBClassifier()
+    model_1.fit(X_train, y_train)
+    optimized_GBM_1 = GridSearchCV(estimator=model_1, param_grid=param_grid_1, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_1.fit(X_train, y_train)
+    params_1=optimized_GBM_1.best_params_
+    print('Performance after first adjustment:{}'.format(optimized_GBM_1.best_score_))
+    
+    model_2= XGBClassifier(n_estimators=params_1['n_estimators'])
+    model_2.fit(X_train, y_train)
+    optimized_GBM_2 = GridSearchCV(estimator=model_2, param_grid=param_grid_2, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_2.fit(X_train, y_train)
+    params_2=optimized_GBM_2.best_params_
+    print('Performance after second adjustment:{}'.format(optimized_GBM_2.best_score_))
+    
+    model_3= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'])
+    model_3.fit(X_train, y_train)
+    optimized_GBM_3 = GridSearchCV(estimator=model_3, param_grid=param_grid_3, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_3.fit(X_train, y_train)
+    params_3=optimized_GBM_3.best_params_
+    print('Performance after third adjustment:{}'.format(optimized_GBM_3.best_score_))
+    
+    model_4= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'])
+    model_4.fit(X_train, y_train)
+    optimized_GBM_4 = GridSearchCV(estimator=model_4, param_grid=param_grid_4, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_4.fit(X_train, y_train)
+    params_4=optimized_GBM_4.best_params_
+    print('Performance after fourth adjustment:{}'.format(optimized_GBM_4.best_score_))
+    
+    model_5= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'],
+                           subsample=params_4['subsample'],
+                           colsample_bytree=params_4['colsample_bytree'])
+    model_5.fit(X_train, y_train)
+    optimized_GBM_5 = GridSearchCV(estimator=model_5, param_grid=param_grid_5, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_5.fit(X_train, y_train)
+    params_5=optimized_GBM_5.best_params_
+    print('Performance after fifth adjustment:{}'.format(optimized_GBM_5.best_score_))
+    
+    model_6= XGBClassifier(n_estimators=params_1['n_estimators'],
+                           max_depth=params_2['max_depth'],
+                           min_child_weight=params_2['min_child_weight'],
+                           gamma=params_3['gamma'],
+                           subsample=params_4['subsample'],
+                           colsample_bytree=params_4['colsample_bytree'],
+                           reg_alpha=params_5['reg_alpha'],
+                           reg_lambda=params_5['reg_lambda'])
+    model_6.fit(X_train, y_train)
+    optimized_GBM_6 = GridSearchCV(estimator=model_6, param_grid=param_grid_6, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
+    optimized_GBM_6.fit(X_train, y_train)
+    print('Performance after final adjustment:{}'.format(optimized_GBM_6.best_score_))
+    
+    prediction = optimized_GBM_6.predict(X_test)
+    
+    print(classification_report(y_test, prediction))
+
+##trade    
+def trade_D(units=100000,stoploss=0.0100):
+    window = 'D'
+    days_ahead = 3    
+    client=API(access_token=account.access_token)
+    instrument = account.instrument
+    actionid = 0
+    gap = timedelta(minutes = 2)
+    fill_1 = 'n'
+    fill_2 = 'n'
+    fill_3 = 'n'
+    fill_4 = 'n'
+    
+    print('Model training start time',datetime.today())
+    model = XGBX(data_train_D(window=window,days_ahead=days_ahead))
+    print('Model training end time',datetime.today())
+    x = datetime.today()
+    
+    if x.isoweekday() == 7:
+        y = x.replace(day=x.day, hour=6, minute=0, second=0, microsecond=0)+timedelta(days=1) #China
+    elif x.isoweekday() == 1 and x.hour <6:
+        y = x.replace(day=x.day, hour=6, minute=0, second=0, microsecond=0)
+    else:
+        if x.hour >=6:
+            y = x.replace(day=x.day, hour=x.hour, minute=59, second=30, microsecond=0)+timedelta(days=1)
+        else:
+            y = x.replace(day=x.day, hour=x.hour, minute=59, second=30, microsecond=0)
+    delta_t=y-x
+    secs=delta_t.total_seconds()
+    print('Trade Process Start Time:',y)
+    print('Waiting...')
+    time.sleep(secs)
+    print('Processing...')
+    y_pred = model.predict(data_input_D(window=window))
+    
+    try:
+        r = trades.OpenTrades(accountID=account.account_1)
+        rv = client.request(r)
+        time_1 = datetime.strptime(rv['trades'][0]['time'],'%Y-%m-%dT%H:%M:%S.%f')
+        fill_1 = 'y'
+    except:
+        time_1 = datetime.now()
+        
+    try:
+        r = trades.OpenTrades(accountID=account.account_2)
+        rv = client.request(r)
+        time_2 = datetime.strptime(rv['trades'][0]['time'],'%Y-%m-%dT%H:%M:%S.%f')
+        fill_2 = 'y'
+    except:
+        time_2 = datetime.now()
+    
+    try:
+        r = trades.OpenTrades(accountID=account.account_3)
+        rv = client.request(r)
+        time_3 = datetime.strptime(rv['trades'][0]['time'],'%Y-%m-%dT%H:%M:%S.%f')
+        fill_3 = 'y'
+    except:
+        time_3 = datetime.now()
+    
+    try:
+        r = trades.OpenTrades(accountID=account.account_4)
+        rv = client.request(r)
+        time_4 = datetime.strptime(rv['trades'][0]['time'],'%Y-%m-%dT%H:%M:%S.%f')
+        fill_4 = 'y'
+    except:
+        time_4 = datetime.now()
+    
+    if datetime.today().isoweekday() !=7 or datetime.today().isoweekday() !=1 or datetime.today().isoweekday() !=2:
+        difference_1=datetime.now()+gap-time_1
+        difference_2=datetime.now()+gap-time_2
+        difference_3=datetime.now()+gap-time_3
+        difference_4=datetime.now()+gap-time_4
+    else:
+        difference_1=datetime.now()+gap-time_1-timedelta(days=2)
+        difference_2=datetime.now()+gap-time_2-timedelta(days=2)
+        difference_3=datetime.now()+gap-time_3-timedelta(days=2)
+        difference_4=datetime.now()+gap-time_4-timedelta(days=2)
+    
+    if difference_1.total_seconds() >= timedelta(days=3).total_seconds():
+        actionid = 1
+        try:
+            closetrade(account.account_1, client, actionid)
+            fill_1 = 'n'
+        except:
+            print('Fail to close trade in account {}'.format(actionid))
+    
+    if difference_2.total_seconds() >= timedelta(days=3).total_seconds():
+        actionid =2
+        try:
+            closetrade(account.account_2, client, actionid)
+            fill_2 = 'n'
+        except:
+            print('Fail to close trade in account {}'.format(actionid))
+    
+    if difference_3.total_seconds() >= timedelta(days=3).total_seconds():
+        actionid = 3
+        try:
+            closetrade(account.account_3, client, actionid)
+            fill_3 = 'n'
+        except:
+            print('Fail to close trade in account {}'.format(actionid))
+    
+    if difference_4.total_seconds() >= timedelta(days=3).total_seconds():
+        actionid = 4
+        try:
+            closetrade(account.account_4, client, actionid)
+            fill_4 = 'n'
+        except:
+            print('Fail to close trade in account {}'.format(actionid))
+        
+    if actionid != 0:
+        if actionid==1:
+            accountID = account.account_1
+            if y_pred == 1:
+                try:
+                    opentrade(accountID, instrument, units, client, stoploss, actionid)
+                except:
+                    print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+            else:
+                print('Predicted Result: Long, Do Nothing')
+                
+        elif actionid==2:
+            accountID = account.account_2
+            if y_pred == 1:    
+                try:
+                    opentrade(accountID, instrument, units, client, stoploss, actionid)
+                except:
+                    print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+            else:
+                print('Predicted Result: Long, Do Nothing')
+                
+        elif actionid==3:
+            accountID = account.account_3
+            if y_pred == 1:    
+                try:
+                    opentrade(accountID, instrument, units, client, stoploss, actionid)
+                except:
+                    print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+            else:
+                print('Predicted Result: Long, Do Nothing')
+                
+        elif actionid == 4:
+            accountID = account.account_4
+            if y_pred == 1:    
+                try:
+                    opentrade(accountID, instrument, units, client, stoploss, actionid)
+                except:
+                    print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+            else:
+                print('Predicted Result: Long, Do Nothing')
+        else:
+            print('Wrong in actionid process')
+    else:
+        if fill_1 == 'n':
+            accountID = account.account_1
+            if y_pred == 1:    
+                try:
+                    opentrade(accountID, instrument, units, client, stoploss, actionid)
+                except:
+                    print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+            else:
+                print('Predicted Result: Long, Do Nothing')
+        else:
+            if fill_2 == 'n':
+                accountID = account.account_2
+                if y_pred == 1:    
+                    try:
+                        opentrade(accountID, instrument, units, client, stoploss, actionid)
+                    except:
+                        print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                else:
+                    print('Predicted Result: Long, Do Nothing')
+            else:
+                if fill_3 == 'n':
+                    accountID = account.account_3
+                    if y_pred == 1:    
+                       try:
+                           opentrade(accountID, instrument, units, client, stoploss, actionid)
+                       except:
+                           print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))                           
+                    else:
+                        print('Predicted Result: Long, Do Nothing')
+                else:
+                    if fill_4 == 'n':
+                        accountID = account.account_4
+                        if y_pred == 1:    
+                            try:
+                                opentrade(accountID, instrument, units, client, stoploss, actionid)
+                            except:
+                                print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                        else:
+                            print('Predicted Result: Long, Do Nothing')
+                    else:
+                        print('Error in fill')
+    
+    a = accounts.AccountSummary(accountID)
+    client.request(a)
+    print(a.response)
+
+
+
+def trade_H(units=100000,times=6,stoploss=0.0100):
+    window = 'H4'
+    days_ahead = 3    
+    client=API(access_token=account.access_token)
+    instrument = account.instrument
+    actionid = 0
+    gap = timedelta(minutes = 2)
+    fill_1 = 'n'
+    fill_2 = 'n'
+    fill_3 = 'n'
+    fill_4 = 'n'
+    n = 1
+    print('Model training start time',datetime.today())
+    x = datetime.today()
+    model = XGBX(data_train_H(window=window,days_ahead=days_ahead))
+    print('Model training end time',datetime.today())
+    if x.isoweekday() == 7:
+        y = x.replace(day=x.day, hour=6, minute=0, second=0, microsecond=0)+timedelta(days=1) #China
+    elif x.isoweekday() == 1 and x.hour <6:
+        y = x.replace(day=x.day, hour=6, minute=0, second=0, microsecond=0)
+    else:
+        y = x.replace(day=x.day, hour=x.hour, minute=59, second=30, microsecond=0)+timedelta(hours=3)
+    delta_t=y-x
+    secs=delta_t.total_seconds()
+    print('Trade Process Start Time:',y)
+    print('About',secs,'seconds to wait')
+    time.sleep(secs)
+    
+    while n <=times:
+        
+        y_pred = model.predict(data_input_H(window=window))
+                
+        try:
+            r = trades.OpenTrades(accountID=account.account_1)
+            rv = client.request(r)
+            time_1 = datetime.strptime(rv['trades'][0]['time'],'%Y-%m-%dT%H:%M:%S.%f')
+            fill_1 = 'y'
+        except:
+            time_1 = datetime.now()
+            
+        try:
+            r = trades.OpenTrades(accountID=account.account_2)
+            rv = client.request(r)
+            time_2 = datetime.strptime(rv['trades'][0]['time'],'%Y-%m-%dT%H:%M:%S.%f')
+            fill_2 = 'y'
+        except:
+            time_2 = datetime.now()
+        
+        try:
+            r = trades.OpenTrades(accountID=account.account_3)
+            rv = client.request(r)
+            time_3 = datetime.strptime(rv['trades'][0]['time'],'%Y-%m-%dT%H:%M:%S.%f')
+            fill_3 = 'y'
+        except:
+            time_3 = datetime.now()
+        
+        try:
+            r = trades.OpenTrades(accountID=account.account_4)
+            rv = client.request(r)
+            time_4 = datetime.strptime(rv['trades'][0]['time'],'%Y-%m-%dT%H:%M:%S.%f')
+            fill_4 = 'y'
+        except:
+            time_4 = datetime.now()
+        
+        if datetime.today().isoweekday() ==1 and datetime.today().hours < 6+12: #China local time
+            difference_1=datetime.now()+gap-time_1-timedelta(days=2)
+            difference_2=datetime.now()+gap-time_2-timedelta(days=2)
+            difference_3=datetime.now()+gap-time_3-timedelta(days=2)
+            difference_4=datetime.now()+gap-time_4-timedelta(days=2)
+        else:
+            difference_1=datetime.now()+gap-time_1
+            difference_2=datetime.now()+gap-time_2
+            difference_3=datetime.now()+gap-time_3
+            difference_4=datetime.now()+gap-time_4
+        
+        if difference_1.total_seconds() >= timedelta(hours=12).total_seconds():
+            actionid = 1
+            try:   
+                closetrade(account.account_1, client, actionid)
+                fill_1 = 'n'
+            except:
+                print('Fail to close trade in account {}'.format(actionid))
+        
+        if difference_2.total_seconds() >= timedelta(hours=12).total_seconds():
+            actionid =2
+            try:   
+                closetrade(account.account_2, client, actionid)
+                fill_2 = 'n'
+            except:
+                print('Fail to close trade in account {}'.format(actionid))
+        
+        if difference_3.total_seconds() >= timedelta(hours=12).total_seconds():
+            actionid = 3
+            try:   
+                closetrade(account.account_3, client, actionid)
+                fill_3 = 'n'
+            except:
+                print('Fail to close trade in account {}'.format(actionid))
+        
+        if difference_4.total_seconds() >= timedelta(hours=12).total_seconds():
+            actionid = 4
+            try:   
+                closetrade(account.account_4, client, actionid)
+                fill_4 = 'n'
+            except:
+                print('Fail to close trade in account {}'.format(actionid))
+            
+        if actionid != 0:
+            if actionid==1:
+                accountID = account.account_1
+                if y_pred == 1:
+                    try:
+                        opentrade(accountID, instrument, units, client, stoploss, actionid)
+                        fill_1 = 'y'
+                    except:
+                        print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                else:
+                    print('Predicted Result: Long, Do Nothing')
+                    
+            elif actionid==2:
+                accountID = account.account_2
+                if y_pred == 1:
+                    try:
+                        opentrade(accountID, instrument, units, client, stoploss, actionid)
+                        fill_2 = 'y'
+                    except:
+                        print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                else:
+                    print('Predicted Result: Long, Do Nothing')
+                    
+            elif actionid==3:
+                accountID = account.account_3
+                if y_pred == 1:
+                    try:                        
+                        opentrade(accountID, instrument, units, client, stoploss, actionid)
+                        fill_3 = 'y'
+                    except:
+                        print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                else:
+                    print('Predicted Result: Long, Do Nothing')
+                    
+            elif actionid == 4:
+                accountID = account.account_4
+                if y_pred == 1:    
+                    try:
+                        opentrade(accountID, instrument, units, client, stoploss, actionid)
+                        fill_4 = 'y'
+                    except:
+                        print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                else:
+                    print('Predicted Result: Long, Do Nothing')
+            else:
+                print('Wrong in actionid process')
+        else:
+            if fill_1 == 'n':
+                accountID = account.account_1
+                if y_pred == 1:    
+                    try:
+                        opentrade(accountID, instrument, units, client, stoploss, actionid)
+                        fill_1 = 'y'
+                    except:
+                        print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                else:
+                    print('Predicted Result: Long, Do Nothing')
+            else:
+                if fill_2 == 'n':
+                    accountID = account.account_2
+                    if y_pred == 1:
+                        try:
+                            opentrade(accountID, instrument, units, client, stoploss, actionid)
+                            fill_2 = 'y'
+                        except:
+                            print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))                       
+                    else:
+                        print('Predicted Result: Long, Do Nothing')
+                else:
+                    if fill_3 == 'n':
+                        accountID = account.account_3
+                        if y_pred == 1:    
+                            try:
+                                opentrade(accountID, instrument, units, client, stoploss, actionid)
+                                fill_3 = 'y'
+                            except:
+                                print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                        else:
+                            print('Predicted Result: Long, Do Nothing')
+                    else:
+                        if fill_4 == 'n':
+                            accountID = account.account_4
+                            if y_pred == 1:    
+                                try:
+                                    opentrade(accountID, instrument, units, client, stoploss, actionid)
+                                    fill_4 = 'y'
+                                except:
+                                    print('Predicted Result: Short, fail to open trade in account {}'.format(actionid))
+                            else:
+                                print('Predicted Result: Long, Do Nothing')
+                        else:
+                            print('Somethings wrong, not good')
+        
+        a = accounts.AccountSummary(accountID)
+        client.request(a)
+        print(a.response)
+        n += 1
+        
+        if n > times:
+            print('Finished time:',datetime.today())
+            sys.exit('Done')
+        if datetime.today().isoweekday() ==6 and datetime.today().hours >=6:#China local time
+            print('Passed market time',datetime.today())
+            sys.exit('See u around')
+        
+        time.sleep(30)
+        print('The',n,'time model training start time',datetime.today())
+        model = XGBX(data_train_H(window=window,days_ahead=days_ahead))
+        print('The',n,'model training end time',datetime.today())
+        x = datetime.today()
+        y = x.replace(day=x.day, hour=x.hour, minute=59, second=30, microsecond=0)+timedelta(hours=4)
+        delta_t=y-x
+        secs=delta_t.total_seconds()
+        print('The',n,'Trade Process Start Time:',y)
+        print('Waiting...')
+        time.sleep(secs)
+        
+#set time
+def action_D(units=100000,stoploss=0.0100,h=6,m=0,s=0,ms=0,tmr='N'):
+    x = datetime.today()
+    if tmr == 'N':
+        y = x.replace(day=x.day, hour=h, minute=m, second=s, microsecond=ms)
+    else:
+        y = x.replace(day=x.day, hour=h, minute=m, second=s, microsecond=ms)+timedelta(days=1)
+    delta_t=y-x
+    secs=delta_t.total_seconds()
+    def run():
+        trade_D(units,stoploss)
+        z = datetime.today()
+        print('Program Finish Time:',z)
+    print('Program Start Time:',x)
+    t = Timer(secs, run)
+    t.start()
+    print('Waiting...')
+    
+def action_H(units=100000,times=6,stoploss=0.0100,h=6,m=0,s=0,ms=0,tmr='N'):
+    x = datetime.today()
+    if tmr == 'N':
+        y = x.replace(day=x.day, hour=h, minute=m, second=s, microsecond=ms)
+    else:
+        y = x.replace(day=x.day, hour=h, minute=m, second=s, microsecond=ms)+timedelta(days=1)
+    delta_t=y-x
+    secs=delta_t.total_seconds()
+    def run():
+        trade_H(units,times,stoploss)
+    print('Program Start Time:',x)
+    t = Timer(secs, run)
+    t.start()
+    print('Waiting...')
+    
+def action_H_auto(units=100000,times=6,stoploss=0.0100):#based on China time 6AM-10AM,10AM-2PM,2PM-6PM,6PM-10PM,10PM-2AM,2AM-6AM
+    x = datetime.today()
+    period_1 = list(range(6,10))
+    period_2 = list(range(10,14))
+    period_3 = list(range(14,18))
+    period_4 = list(range(18,22))
+    period_5 = list(range(22,24))+list(range(0,2))
+    '''
+    period_6 = list(range(2,6))
+    '''
+    rest_sat = list(range(6,24))
+    rest_mon = list(range(0,6))
+    
+    if x.isoweekday()==6 and x.hour in rest_sat:
+        y = x.replace(day=x.day, hour=6, minute=0, second=0, microsecond=0)+timedelta(days=2)
+    else:
+        if x.isoweekday()==1 and x.hour in rest_mon:
+            y = x.replace(day=x.day, hour=6, minute=0, second=0, microsecond=0)
+        else:
+           if x.isoweekday()==7:
+               y = x.replace(day=x.day, hour=6, minute=0, second=0, microsecond=0)+timedelta(days=1)
+           else:        
+                if x.hour in period_1:
+                    y = x.replace(day=x.day, hour=10, minute=0, second=0, microsecond=0)
+                elif x.hour in period_2:
+                    y = x.replace(day=x.day, hour=14, minute=0, second=0, microsecond=0)
+                elif x.hour in period_3:
+                    y = x.replace(day=x.day, hour=18, minute=0, second=0, microsecond=0)
+                elif x.hour in period_4:
+                    y = x.replace(day=x.day, hour=22, minute=0, second=0, microsecond=0)
+                elif x.hour in period_5:
+                    y = x.replace(day=x.day, hour=2, minute=0, second=0, microsecond=0)+timedelta(days=1)
+                else:
+                    y = x.replace(day=x.day, hour=6, minute=0, second=0, microsecond=0)
+        
+    delta_t=y-x
+    secs=delta_t.total_seconds()
+    def run():
+        trade_H(units,times,stoploss)
+    print('Program Start Time:',x)
+    t = Timer(secs, run)
+    t.start()
+    print('Trade will start at',y)
+    print(secs,'to wait')
+    print('Waiting...')
