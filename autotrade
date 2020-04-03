@@ -388,7 +388,7 @@ def XGBX(data, random_state=7):
     y_test= y_testo.append(y_testn)
     '''
     
-    n_estimators_list=[1,250,500,750,1000,1250,1500,1750,2000,2250,2500,2750,3000,3250]
+    n_estimators_list=[...]
     param_grid_0 = {'n_estimators': n_estimators_list}
     param_grid_2 = {'max_depth':[1,2,3,4,5,6,7,8,9,10],
                   'min_child_weight':[1,2,3,4,5]}
@@ -507,7 +507,7 @@ def XGBX_pre(data, X_input, days_ahead=3, random_state=7, whole='N'):
         X_train = data[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
         y_train = data['up_or_down']
     
-    n_estimators_list=[1,250,500,750,1000,1250,1500,1750,2000,2250,2500,2750,3000,3250]
+    n_estimators_list=[...]
     param_grid_0 = {'n_estimators': n_estimators_list}
     
     param_grid_2 = {'max_depth':[1,2,3,4,5,6,7,8,9,10],
@@ -591,108 +591,6 @@ def XGBX_pre(data, X_input, days_ahead=3, random_state=7, whole='N'):
     
     return y_pred[len(y_pred)-1]
 
-def test_XGB(data, days_ahead=3, random_state=7):
-    old_list=seperate_old(data, 0.7)
-    new_list=seperate_new(data, 0.7)
-    
-    X_new = new_list[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
-    Y_new = new_list['up_or_down']
-    X_old = old_list[['Volume','ocd','hld','EMA12','EMA26','MACD','signal','histogram','full%k','full%d']]
-    Y_old = old_list['up_or_down']
-    
-    test_sizeo = 1- 0.6572
-    X_traino, X_testo, y_traino, y_testo = train_test_split(X_old, Y_old, test_size=test_sizeo, random_state=random_state)
-    
-    test_sizen = 1- 0.8
-    X_trainn, X_testn, y_trainn, y_testn = train_test_split(X_new, Y_new, test_size=test_sizen, random_state=random_state)
-    
-    X_train= X_traino.append(X_trainn)
-    y_train= y_traino.append(y_trainn)
-    X_test= X_testo.append(X_testn)
-    y_test= y_testo.append(y_testn)
-    
-    n_estimators_list=[1,250,500,750,1000,1250,1500,1750,2000,2250,2500,2750,3000,3250]
-    param_grid_0 = {'n_estimators': n_estimators_list}
-    param_grid_2 = {'max_depth':[1,2,3,4,5,6,7,8,9,10],
-                  'min_child_weight':[1,2,3,4,5]}
-    param_grid_3 = {'gamma':[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}
-    param_grid_4 = {'subsample':[0.5,0.6,0.7,0.8,0.9,1.0],
-                  'colsample_bytree':[0.7,0.8,0.9,1.0]}
-    param_grid_5 = {'reg_alpha': [0.0, 0.1, 0.2, 0.3, 0.4],
-                  'reg_lambda': [0.5,0.6, 0.7, 0.8, 0.9, 1]}
-    param_grid_6 = {'learning_rate': [0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15]}
-    
-    model_0= XGBClassifier()
-    model_0.fit(X_train, y_train)
-    optimized_GBM_0 = GridSearchCV(estimator=model_0, param_grid=param_grid_0, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
-    optimized_GBM_0.fit(X_train, y_train)
-    params_0=optimized_GBM_0.best_params_
-    print('Performance after initial adjustment:{}'.format(optimized_GBM_0.best_score_))
-    
-    params_num = int(params_0['n_estimators'])
-    n_estimators_list=list(range(params_num-250, params_num+251))
-    param_grid_1 = {'n_estimators': n_estimators_list}
-    model_1= XGBClassifier()
-    model_1.fit(X_train, y_train)
-    optimized_GBM_1 = GridSearchCV(estimator=model_1, param_grid=param_grid_1, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
-    optimized_GBM_1.fit(X_train, y_train)
-    params_1=optimized_GBM_1.best_params_
-    print('Performance after first adjustment:{}'.format(optimized_GBM_1.best_score_))
-    
-    model_2= XGBClassifier(n_estimators=params_1['n_estimators'])
-    model_2.fit(X_train, y_train)
-    optimized_GBM_2 = GridSearchCV(estimator=model_2, param_grid=param_grid_2, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
-    optimized_GBM_2.fit(X_train, y_train)
-    params_2=optimized_GBM_2.best_params_
-    print('Performance after second adjustment:{}'.format(optimized_GBM_2.best_score_))
-    
-    model_3= XGBClassifier(n_estimators=params_1['n_estimators'],
-                           max_depth=params_2['max_depth'],
-                           min_child_weight=params_2['min_child_weight'])
-    model_3.fit(X_train, y_train)
-    optimized_GBM_3 = GridSearchCV(estimator=model_3, param_grid=param_grid_3, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
-    optimized_GBM_3.fit(X_train, y_train)
-    params_3=optimized_GBM_3.best_params_
-    print('Performance after third adjustment:{}'.format(optimized_GBM_3.best_score_))
-    
-    model_4= XGBClassifier(n_estimators=params_1['n_estimators'],
-                           max_depth=params_2['max_depth'],
-                           min_child_weight=params_2['min_child_weight'],
-                           gamma=params_3['gamma'])
-    model_4.fit(X_train, y_train)
-    optimized_GBM_4 = GridSearchCV(estimator=model_4, param_grid=param_grid_4, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
-    optimized_GBM_4.fit(X_train, y_train)
-    params_4=optimized_GBM_4.best_params_
-    print('Performance after fourth adjustment:{}'.format(optimized_GBM_4.best_score_))
-    
-    model_5= XGBClassifier(n_estimators=params_1['n_estimators'],
-                           max_depth=params_2['max_depth'],
-                           min_child_weight=params_2['min_child_weight'],
-                           gamma=params_3['gamma'],
-                           subsample=params_4['subsample'],
-                           colsample_bytree=params_4['colsample_bytree'])
-    model_5.fit(X_train, y_train)
-    optimized_GBM_5 = GridSearchCV(estimator=model_5, param_grid=param_grid_5, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
-    optimized_GBM_5.fit(X_train, y_train)
-    params_5=optimized_GBM_5.best_params_
-    print('Performance after fifth adjustment:{}'.format(optimized_GBM_5.best_score_))
-    
-    model_6= XGBClassifier(n_estimators=params_1['n_estimators'],
-                           max_depth=params_2['max_depth'],
-                           min_child_weight=params_2['min_child_weight'],
-                           gamma=params_3['gamma'],
-                           subsample=params_4['subsample'],
-                           colsample_bytree=params_4['colsample_bytree'],
-                           reg_alpha=params_5['reg_alpha'],
-                           reg_lambda=params_5['reg_lambda'])
-    model_6.fit(X_train, y_train)
-    optimized_GBM_6 = GridSearchCV(estimator=model_6, param_grid=param_grid_6, scoring='roc_auc', cv=5, verbose=1, n_jobs=4)
-    optimized_GBM_6.fit(X_train, y_train)
-    print('Performance after final adjustment:{}'.format(optimized_GBM_6.best_score_))
-    
-    prediction = optimized_GBM_6.predict(X_test)
-    
-    print(classification_report(y_test, prediction))
 
 ##trade    
 def trade_D(units=100000,stoploss=0.0100):
